@@ -4,7 +4,15 @@
 
 # Installation 
 
-TODO
+In order to use FedVRF in your project, download all necessary modules in your directory of choice via pip or conda, and install their corresponding dependencies, as the following commands suggest:
+
+```Python
+# Using pip/virtualenv
+pip install −r requirements.txt
+
+# Using conda
+conda install --file requirements.txt
+```
 
 
 # Usage
