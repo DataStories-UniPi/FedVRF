@@ -3,17 +3,6 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point, LineString, shape
 
-import rdp
-
-try:
-    import osmnx as ox
-except ModuleNotFoundError:
-    ox = None
-
-import similaritymeasures
-from scipy.interpolate import interp1d
-from sklearn.cluster import OPTICS
-
 import re
 import tqdm
 import multiprocessing
@@ -327,35 +316,6 @@ def temporal_segmentation(df, col_name, threshold=30 * 60, min_pts=10, output_na
     return df_temp_seg
 
 
-def temporal_resampling_v2(df, features=['lat', 'lon'], o_id_name='mmsi', temporal_name='ts', temporal_unit='s',
-                           rate='60S', method='linear', min_pts=1):
-    # The Interpolate module of SciPy requires at least 2 Records
-    if len(df) < min_pts:
-        return df.iloc[0:0].loc[:, features]
-
-    # Define temp. axis and feature space
-    x = pd.to_datetime(df[temporal_name], unit=temporal_unit).values.astype(np.int64)
-    y = df[features].values
-
-    # Fetch the starting and ending timestamps of the trajectory
-    dt_start = pd.to_datetime(df[temporal_name].min(), unit=temporal_unit)
-    dt_end = pd.to_datetime(df[temporal_name].max(), unit=temporal_unit)
-
-    # Interpolate
-    f = interp1d(x, y, kind=method, axis=0)
-    xnew_V3 = pd.date_range(start=dt_start.round(rate), end=dt_end, freq=rate, inclusive='right')
-
-    # Reconstruct the new (resampled) dataframe
-    df_RESAMPLED = pd.DataFrame(f(xnew_V3), columns=features)
-    df_RESAMPLED.loc[:, temporal_name] = xnew_V3
-
-    if df_RESAMPLED.empty:
-        return df_RESAMPLED
-
-    df_RESAMPLED.loc[:, o_id_name] = getattr(df.iloc[0, :], o_id_name)
-    return df_RESAMPLED
-
-
 def applyParallel(df_grouped, fun, n_jobs=-1, **kwargs):
     '''
     Forked from: https://stackoverflow.com/a/27027632
@@ -371,123 +331,3 @@ def applyParallel(df_grouped, fun, n_jobs=-1, **kwargs):
         delayed(_fun)(name, group) for name, group in tqdm.tqdm(df_grouped, **kwargs)
     ))
     return pd.concat(result, keys=keys, names=df_grouped_names)
-
-
-def simplify_trajectory(traj, crs=3857):
-    traj_points = traj.to_crs(epsg=crs).loc[:, traj.geometry.name].apply(shapely_coords_numpy).copy()
-    start, end = traj_points.iloc[[0, -1]].values
-
-    ### Get the median distance from the line defined by ```start```, and ```end``` points of the trajectory
-    eps = traj_points.iloc[1:-1].apply(lambda point: rdp.pldist(point, start, end)).median()
-
-    try:
-        # print(f'{eps:.2f=};\t {len(traj_augment)=}')
-        mask = rdp.rdp(traj_points, epsilon=eps, return_mask=True)
-        return traj.loc[mask].copy()
-
-    except ZeroDivisionError:  # The trajectory is already a line
-        return traj
-
-
-def trajectory_distance(traj_i, trajectories, key=['sourcemmsi', 'traj_nr']):
-    dist_idx = trajectories.index.droplevel(-1).unique()
-    distances = pd.Series(np.zeros(len(dist_idx)), index=dist_idx)
-
-    for oid_j, traj_j in trajectories.groupby(key):
-        # print(f'{np.stack(traj_i[trajectories.geometry.name].apply(shapely_coords_numpy).values)=}')
-        # print(f'{np.stack(traj_j[trajectories.geometry.name].apply(shapely_coords_numpy).values)=}')
-
-        distances.loc[oid_j] = similaritymeasures.frechet_dist(
-            np.stack(traj_i[trajectories.geometry.name].apply(shapely_coords_numpy).values),
-            np.stack(traj_j[trajectories.geometry.name].apply(shapely_coords_numpy).values)
-        )
-
-    # print(f'{distances=}')
-    return distances
-
-
-def trajectory_clustering(trajectories, key=['mmsi', 'traj_nr'], save_sim_matrix=True, eps=1852, crs=3857, n_jobs=-1, **kwargs):
-    n_trajectories = trajectories.groupby(key).groups
-
-    if len(n_trajectories) < 2:
-        return None
-
-    # First things first, in order to accelerate computations, we use Douglas-Peucker for trajectory compression.
-    ## The ```eps``` parameter is determined using the median points' distance from their corresponding start and ending point.
-    traj_rdp = applyParallel(trajectories.groupby(key), simplify_trajectory, n_jobs=n_jobs,
-                             desc='Trajectory Compression...')
-
-    # Afterwards, we use the compressed trajectories to create their corresponding similarity matrix
-    ## Metric: Discrete Frechét Distance
-    traj_rdp_3857 = traj_rdp.to_crs(crs).copy()
-
-    traj_rdp_sim_matrix = applyParallel(
-        traj_rdp_3857.reset_index(level=(0, 1)).groupby(key),
-        lambda l: trajectory_distance(l, traj_rdp_3857, key),
-        n_jobs=n_jobs,
-        desc='Calculating Similarity Matrix...'
-    )
-
-    traj_rdp_sim_matrix = traj_rdp_sim_matrix.to_frame()
-    traj_rdp_sim_matrix = pd.pivot_table(
-        traj_rdp_sim_matrix,
-        index=[traj_rdp_sim_matrix.index.get_level_values(0), traj_rdp_sim_matrix.index.get_level_values(1)],
-        columns=[traj_rdp_sim_matrix.index.get_level_values(2), traj_rdp_sim_matrix.index.get_level_values(3)]
-    )
-
-    if save_sim_matrix:
-        traj_rdp_sim_matrix.to_pickle(kwargs['path'])
-
-    # Clustering with OPTICS (using the precomputed similarity matrix)
-    optics_clusters = OPTICS(
-        eps=eps, cluster_method='dbscan', min_samples=2, metric='precomputed', n_jobs=n_jobs
-    ).fit(traj_rdp_sim_matrix)
-    return pd.Series(optics_clusters.labels_, index=traj_rdp_sim_matrix.index, name='cluster_id')
-
-
-def mask_3sigma(trajectory, feats, interval_stats, sigma_ratio=3):
-    res = trajectory[feats].diff()    
-    res.fillna({k: interval_stats.loc[k, 'mean'] for k in feats}, limit=1, inplace=True)
-    
-    masks_3sigma = [
-        res[feat].between(
-            interval_stats.loc[feat, 'mean'] - sigma_ratio * interval_stats.loc[feat, 'std'],
-            interval_stats.loc[feat, 'mean'] + sigma_ratio * interval_stats.loc[feat, 'std'],
-            inclusive='both'
-        ) for feat in feats
-    ]
-    
-    return trajectory.loc[np.logical_and.reduce(masks_3sigma, axis=0)].copy()
-
-
-def drop_outliers_3sigma(trajectory, time_name, gdf_seg_stats, bins=np.arange(0, 1801, 60), feats=['lon_3857', 'lat_3857'], sigma_ratio=3, n_iters=-1, verbose=False, **kwargs):
-    tqdm.tqdm.pandas(disable=not verbose, **kwargs)
-    
-    trajectory_clean = trajectory.sort_values(time_name).copy()
-    no_of_recs_before = trajectory_clean.shape[0]
-    
-    while ((iter_no := 0) < n_iters or n_iters == -1):
-        buckets = pd.cut(trajectory_clean[time_name].diff(), bins)
-
-        trajectory_clean = pd.concat((
-            # Compensate for NaN records due to diff()
-            trajectory_clean.loc[buckets.isna()].copy(),
-            
-            # Drop outliers based on three sigma method
-            trajectory_clean.groupby(
-                buckets, group_keys=False
-            ).progress_apply(
-                lambda l: mask_3sigma(l.copy(), ['lon_3857', 'lat_3857'], gdf_seg_stats.loc[l.name], sigma_ratio=3)
-            )
-        ))
-
-        if trajectory_clean.shape[0] == no_of_recs_before:
-            break
-
-        if verbose:
-            print(f'{no_of_recs_before=}, {trajectory_clean.shape[0]=}')
-            
-        no_of_recs_before = trajectory_clean.shape[0]
-        iter_no += 1
-
-    return trajectory_clean
