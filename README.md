@@ -1,3 +1,5 @@
+# NOTE: This repository is no longer active. Please visit [Nautilus](https://github.com/DataStories-UniPi/Nautilus) for latest updates.
+
 # Federated Route Forecasting over Maritime Data Silos (FedVRF)
 ### Official Python implementation of the FedVRF model from the paper "Federated Vessel Route Forecasting over Maritime Data Silos"
 
